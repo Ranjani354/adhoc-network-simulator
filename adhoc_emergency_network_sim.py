@@ -7,6 +7,7 @@ import math
 from copy import deepcopy
 from itertools import combinations
 import pandas as pd
+import time
 
 st.set_page_config(layout="wide")
 st.title("💡 Advanced Emergency Response Ad Hoc Network Simulator")
@@ -135,7 +136,6 @@ def flooding(G, src, dst, max_hops=10):
 
 # --- Energy-aware Shortest Path ---
 def energy_aware_path(G, nodes_dict, src, dst):
-    # Weighted by inverse energy
     for u, v in G.edges():
         avg_energy = (nodes_dict[u]["energy"] + nodes_dict[v]["energy"]) / 2
         G[u][v]["weight"] = 1.0 / max(avg_energy, 1)
@@ -199,25 +199,19 @@ for t in range(st.session_state.current_round):
 
     failures_per_round.append(len([n for n in nodes_sim.values() if not n["alive"]]))
 
-# --- Network Plot ---
+# --- Network Plot (with fixed color length) ---
 fig, ax = plt.subplots(figsize=(6,6))
-pos = {i: nodes_sim[i]["pos"] for i in nodes_sim}
-node_colors = [compute_color(nodes_sim[i], initial_energy) for i in nodes_sim]
-
-# Command center node 0 highlighted
-node_color_map = []
-for i in nodes_sim:
-    if i == 0:
-        node_color_map.append("gold")
-    else:
-        node_color_map.append(compute_color(nodes_sim[i], initial_energy))
-
+alive_nodes = list(G_last.nodes())
+pos = {i: nodes_sim[i]["pos"] for i in alive_nodes}
+node_color_map = ["gold" if i==0 else compute_color(nodes_sim[i], initial_energy) for i in alive_nodes]
 nx.draw(G_last, pos, with_labels=True, node_color=node_color_map, ax=ax, node_size=500)
+
+# Draw dead nodes
 for i in nodes_sim:
     if not nodes_sim[i]["alive"]:
-        ax.scatter(nodes_sim[i]["pos"][0], nodes_sim[i]["pos"][1], marker='x', s=200, linewidths=3)
+        ax.scatter(nodes_sim[i]["pos"][0], nodes_sim[i]["pos"][1], marker='x', s=200, color='red', linewidths=3)
 
-# Last message path highlight
+# Highlight last message path
 last_success = next((h for h in reversed(history) if h["delivered"]), None)
 if show_paths and last_success and len(last_success["path"])>=2:
     path_edges = list(zip(last_success["path"], last_success["path"][1:]))
@@ -241,62 +235,4 @@ with st.expander("📊 Node Details & Metrics"):
             "Messages Sent": n["messages_sent"],
             "Messages Received": n["messages_received"]
         })
-    df_nodes = pd.DataFrame(node_table).set_index("Node")
-    st.dataframe(df_nodes)
-
-# Delivery ratio and average hops
-valid_deliveries = [d for d in delivery_stats if d is not None]
-st.write(f"**Delivery Ratio:** {len(valid_deliveries)}/{len(delivery_stats)} ({100*len(valid_deliveries)/len(delivery_stats):.1f}%)")
-st.write(f"**Average Path Length (Hops):** {np.mean(valid_deliveries) if valid_deliveries else 0:.2f}")
-st.write(f"**Node Failures:** {len([n for n in nodes_sim.values() if not n['alive']])}/{num_nodes}")
-
-# --- Energy & Performance Charts ---
-st.subheader("📈 Performance Charts")
-col1, col2 = st.columns(2)
-with col1:
-    plt.figure()
-    plt.plot(range(1, len(failures_per_round)+1), failures_per_round, marker='o')
-    plt.title("Node Failures per Round")
-    plt.xlabel("Round")
-    plt.ylabel("Number of Failed Nodes")
-    st.pyplot(plt)
-
-with col2:
-    avg_energy = [np.mean([n["energy_history"][t] for n in nodes_sim.values() if len(n["energy_history"])>t]) 
-                  for t in range(st.session_state.current_round)]
-    plt.figure()
-    plt.plot(range(1, len(avg_energy)+1), avg_energy, marker='o', color='green')
-    plt.title("Average Network Energy per Round")
-    plt.xlabel("Round")
-    plt.ylabel("Energy")
-    st.pyplot(plt)
-
-# Node energy history plot
-st.subheader("🔋 Node Energy Over Time")
-selected_nodes = st.multiselect("Select nodes to plot", list(nodes_sim.keys()), default=[0])
-plt.figure(figsize=(8,4))
-for i in selected_nodes:
-    plt.plot(nodes_sim[i]["energy_history"], label=f"Node {i}")
-plt.title("Node Energy History")
-plt.xlabel("Round")
-plt.ylabel("Energy")
-plt.legend()
-st.pyplot(plt)
-
-# --- Event Log ---
-with st.expander("📜 Event Log (Last 50 events)"):
-    for e in st.session_state.event_log[-50:]:
-        st.write(e)
-
-# --- Export CSV ---
-st.subheader("💾 Export Simulation Data")
-col1, col2 = st.columns(2)
-with col1:
-    csv_nodes = df_nodes.to_csv().encode('utf-8')
-    st.download_button("Download Node Data CSV", csv_nodes, "nodes.csv", "text/csv")
-with col2:
-    df_events = pd.DataFrame(st.session_state.event_log, columns=["Event"])
-    csv_events = df_events.to_csv(index=False).encode('utf-8')
-    st.download_button("Download Event Log CSV", csv_events, "event_log.csv", "text/csv")
-
-st.info("🔹 Try changing parameters, routing, mobility, or reset simulation to explore scenarios!")
+    df_nodes = pd.DataFrame(node_table).set_index("
