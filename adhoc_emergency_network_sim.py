@@ -4,23 +4,38 @@ import matplotlib.pyplot as plt
 import random
 import numpy as np
 import math
+from copy import deepcopy
+from itertools import combinations
+import pandas as pd
 
-# --- Simulation Parameters ---
-st.title("Advanced Emergency Response Ad Hoc Network Simulator")
-num_nodes = st.slider("Number of Mobile Nodes", 5, 30, 15)
-area_size = st.slider("Area Size (meters)", 50, 500, 200)
-communication_range = st.slider("Communication Range (meters)", 10, 100, 40)
-failure_prob = st.slider("Node Failure Probability per Round", 0.0, 0.2, 0.05)
-rounds = st.slider("Simulation Rounds", 10, 100, 30)
-routing_protocol = st.selectbox("Routing Protocol", ["Shortest Path", "Flooding"])
-mobility_model = st.selectbox("Node Mobility Model", ["Random Walk", "Group Mobility"])
-show_paths = st.checkbox("Show Message Path", True)
-enable_replay = st.checkbox("Step-by-step Replay", False)
+st.set_page_config(layout="wide")
+st.title("💡 Advanced Emergency Response Ad Hoc Network Simulator")
+
+# --- UI / Simulation Parameters ---
+col1, col2 = st.columns(2)
+with col1:
+    num_nodes = st.slider("Number of Mobile Nodes", 5, 30, 15)
+    area_size = st.slider("Area Size (meters)", 50, 500, 200)
+    communication_range = st.slider("Communication Range (meters)", 10, 100, 40)
+    failure_prob = st.slider("Node Failure Probability per Round", 0.0, 0.2, 0.05)
+    rounds = st.slider("Simulation Rounds", 10, 100, 30)
+    messages_per_round = st.slider("Messages per Round", 1, 5, 2)
+
+with col2:
+    routing_protocol = st.selectbox("Routing Protocol", ["Shortest Path", "Flooding", "Energy-Aware"])
+    mobility_model = st.selectbox("Node Mobility Model", ["Random Walk", "Group Mobility"])
+    show_paths = st.checkbox("Show Last Message Path", True)
+    enable_replay = st.checkbox("Step-by-step Replay", False)
+    random_seed = st.number_input("Random Seed (for reproducibility)", 0, 9999, 42)
 
 # Energy model parameters
 initial_energy = st.number_input("Initial Node Energy (units)", 10, 1000, 100)
 tx_energy = st.number_input("Energy per Transmission (units)", 1, 10, 2)
 rx_energy = st.number_input("Energy per Reception (units)", 1, 10, 1)
+
+# Set random seed
+random.seed(random_seed)
+np.random.seed(random_seed)
 
 # --- Node Initialization ---
 @st.cache_data(show_spinner=False, persist=True)
@@ -30,13 +45,16 @@ def initialize_nodes(num_nodes, area_size, initial_energy):
         nodes[i] = {
             "pos": [random.uniform(0, area_size), random.uniform(0, area_size)],
             "alive": True,
-            "energy": initial_energy,
+            "energy": float(initial_energy),
             "delivered": 0,
             "failed": 0,
+            "energy_history": [initial_energy],
+            "messages_sent": 0,
+            "messages_received": 0
         }
     return nodes
 
-if 'nodes' not in st.session_state or st.button("Reset Simulation"):
+if 'nodes' not in st.session_state or st.button("🔄 Reset Simulation"):
     st.session_state.nodes = initialize_nodes(num_nodes, area_size, initial_energy)
     st.session_state.history = []
     st.session_state.event_log = []
@@ -45,198 +63,240 @@ if 'nodes' not in st.session_state or st.button("Reset Simulation"):
 nodes = st.session_state.nodes
 history = st.session_state.history
 event_log = st.session_state.event_log
-current_round = st.session_state.current_round
 
 # --- Mobility Models ---
-def move_nodes(nodes, area_size, model):
+def move_nodes(nodes_dict, area_size, model):
     if model == "Random Walk":
-        for i in nodes:
-            if nodes[i]["alive"]:
-                theta = random.uniform(0, 2 * np.pi)
+        for n in nodes_dict.values():
+            if n["alive"]:
+                theta = random.uniform(0, 2 * math.pi)
                 step = random.uniform(0, 8)
-                nodes[i]["pos"][0] = min(area_size, max(0, nodes[i]["pos"][0] + step * np.cos(theta)))
-                nodes[i]["pos"][1] = min(area_size, max(0, nodes[i]["pos"][1] + step * np.sin(theta)))
+                n["pos"][0] = min(area_size, max(0, n["pos"][0] + step * math.cos(theta)))
+                n["pos"][1] = min(area_size, max(0, n["pos"][1] + step * math.sin(theta)))
     elif model == "Group Mobility":
-        # All alive nodes move in roughly the same direction
-        theta = random.uniform(0, 2 * np.pi)
-        for i in nodes:
-            if nodes[i]["alive"]:
+        theta = random.uniform(0, 2 * math.pi)
+        for n in nodes_dict.values():
+            if n["alive"]:
                 step = random.uniform(4, 8)
-                nodes[i]["pos"][0] = min(area_size, max(0, nodes[i]["pos"][0] + step * np.cos(theta)))
-                nodes[i]["pos"][1] = min(area_size, max(0, nodes[i]["pos"][1] + step * np.sin(theta)))
+                n["pos"][0] = min(area_size, max(0, n["pos"][0] + step * math.cos(theta)))
+                n["pos"][1] = min(area_size, max(0, n["pos"][1] + step * math.sin(theta)))
 
-def apply_failure(nodes, failure_prob):
-    for i in nodes:
-        if nodes[i]["alive"] and random.random() < failure_prob:
-            nodes[i]["alive"] = False
-            st.session_state.event_log.append(f"Round: Node {i} failed (random failure).")
+# --- Node Failure ---
+def apply_failure(nodes_dict, failure_prob):
+    for i, n in nodes_dict.items():
+        if n["alive"] and random.random() < failure_prob:
+            n["alive"] = False
+            st.session_state.event_log.append(f"Round {st.session_state.current_round}: Node {i} failed (random failure).")
 
-def update_energy(nodes, path, tx_energy, rx_energy):
-    # For each transmission, deduct tx_energy from sender, rx_energy from receiver (except last)
-    if not path:
-        return
+# --- Energy Update ---
+def update_energy(nodes_dict, path, tx_energy, rx_energy):
+    if not path: return
     for idx, node in enumerate(path):
-        if idx == 0:
-            nodes[node]["energy"] -= tx_energy
-        elif idx == len(path)-1:
-            nodes[node]["energy"] -= rx_energy
-        else:
-            nodes[node]["energy"] -= (tx_energy + rx_energy)
-        if nodes[node]["energy"] <= 0 and nodes[node]["alive"]:
-            nodes[node]["alive"] = False
-            st.session_state.event_log.append(f"Node {node} died (energy depleted).")
+        if not nodes_dict[node]["alive"]: continue
+        if idx == 0 and len(path) > 1:
+            nodes_dict[node]["energy"] -= tx_energy
+            nodes_dict[node]["messages_sent"] += 1
+        elif idx == len(path)-1 and len(path) > 1:
+            nodes_dict[node]["energy"] -= rx_energy
+            nodes_dict[node]["messages_received"] += 1
+        elif 0 < idx < len(path)-1:
+            nodes_dict[node]["energy"] -= (tx_energy + rx_energy)
+        elif len(path) == 1:
+            nodes_dict[node]["energy"] -= rx_energy
+            nodes_dict[node]["messages_received"] += 1
+        # Node death
+        if nodes_dict[node]["energy"] <= 0 and nodes_dict[node]["alive"]:
+            nodes_dict[node]["alive"] = False
+            st.session_state.event_log.append(f"Round {st.session_state.current_round}: Node {node} died (energy depleted).")
+        # record energy history
+        nodes_dict[node]["energy_history"].append(max(0, nodes_dict[node]["energy"]))
 
+# --- Energy Color ---
 def compute_color(node, initial_energy):
-    # Energy color gradient: green (full) -> yellow -> red (empty)
-    if not node["alive"]:
-        return "red"
-    ratio = max(0, node["energy"] / initial_energy)
-    if ratio > 0.6:
-        return "green"
-    elif ratio > 0.3:
-        return "yellow"
-    else:
-        return "orange"
+    if not node["alive"]: return "red"
+    ratio = max(0.0, node["energy"] / float(initial_energy))
+    if ratio > 0.6: return "green"
+    elif ratio > 0.3: return "yellow"
+    else: return "orange"
 
+# --- Flooding Routing ---
 def flooding(G, src, dst, max_hops=10):
-    # Basic flooding to find if dst is reachable (not optimal, for demo)
-    visited = set()
+    visited = set([src])
     queue = [(src, [src])]
     while queue:
         node, path = queue.pop(0)
-        if node == dst:
-            return path
-        if len(path) > max_hops:
-            continue
+        if node == dst: return path
+        if len(path) >= max_hops: continue
         for neighbor in G.neighbors(node):
-            if neighbor not in path:
+            if neighbor not in visited:
+                visited.add(neighbor)
                 queue.append((neighbor, path + [neighbor]))
     return None
 
+# --- Energy-aware Shortest Path ---
+def energy_aware_path(G, nodes_dict, src, dst):
+    # Weighted by inverse energy
+    for u, v in G.edges():
+        avg_energy = (nodes_dict[u]["energy"] + nodes_dict[v]["energy"]) / 2
+        G[u][v]["weight"] = 1.0 / max(avg_energy, 1)
+    try:
+        return nx.shortest_path(G, src, dst, weight="weight")
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return None
+
 # --- Simulation Loop ---
 if enable_replay:
-    # Replay mode: run up to current_round only, allow stepping
     replay_round = st.number_input("Replay round", 1, rounds, 1)
-    st.session_state.current_round = replay_round
+    st.session_state.current_round = int(replay_round)
 else:
-    st.session_state.current_round = rounds
+    st.session_state.current_round = int(rounds)
 
+nodes_sim = deepcopy(nodes)
 delivery_stats = []
 failures_per_round = []
-history.clear()
-event_log_display = []
 
-# Copy node states for simulation
-nodes_sim = {i: nodes[i].copy() for i in nodes}
+G_last = nx.Graph()
 
 for t in range(st.session_state.current_round):
+    st.session_state.current_round = t
     move_nodes(nodes_sim, area_size, mobility_model)
     apply_failure(nodes_sim, failure_prob)
-    # Build network graph based on alive nodes and proximity
+
+    alive_nodes = [i for i, n in nodes_sim.items() if n["alive"]]
     G = nx.Graph()
-    alive_nodes = [i for i in nodes_sim if nodes_sim[i]["alive"]]
     G.add_nodes_from(alive_nodes)
-    for i in alive_nodes:
-        for j in alive_nodes:
-            if i < j:
-                dist = np.linalg.norm(np.array(nodes_sim[i]["pos"]) - np.array(nodes_sim[j]["pos"]))
-                if dist < communication_range:
-                    G.add_edge(i, j)
-    # Message passing simulation
-    if alive_nodes:
+    for i, j in combinations(alive_nodes, 2):
+        if math.hypot(nodes_sim[i]["pos"][0]-nodes_sim[j]["pos"][0],
+                      nodes_sim[i]["pos"][1]-nodes_sim[j]["pos"][1]) <= communication_range:
+            G.add_edge(i, j)
+    G_last = G
+
+    # Multi-message per round
+    for _ in range(messages_per_round):
+        if not alive_nodes: break
         src = random.choice(alive_nodes)
-        dst = 0 if 0 in alive_nodes else alive_nodes[0]  # Command center is node 0 if alive
+        dst = 0 if 0 in alive_nodes else random.choice(alive_nodes)
         path = None
         if routing_protocol == "Shortest Path":
             try:
                 path = nx.shortest_path(G, src, dst)
-            except nx.NetworkXNoPath:
-                path = None
+            except: path = None
         elif routing_protocol == "Flooding":
             path = flooding(G, src, dst)
+        elif routing_protocol == "Energy-Aware":
+            path = energy_aware_path(G, nodes_sim, src, dst)
+
         if path:
             delivery_stats.append(len(path)-1)
             history.append({"round": t, "src": src, "dst": dst, "path": path, "delivered": True})
-            event_log.append(f"Round {t}: Message delivered {src}->{dst} via {path} ({len(path)-1} hops).")
-            # Energy update
+            st.session_state.event_log.append(f"Round {t}: Message {src}->{dst} delivered via {path} ({len(path)-1} hops).")
             update_energy(nodes_sim, path, tx_energy, rx_energy)
             nodes_sim[src]["delivered"] += 1
         else:
             delivery_stats.append(None)
             history.append({"round": t, "src": src, "dst": dst, "path": [], "delivered": False})
-            event_log.append(f"Round {t}: Message delivery failed {src}->{dst}.")
-    failures = [i for i in nodes_sim if not nodes_sim[i]["alive"]]
-    failures_per_round.append(len(failures))
+            st.session_state.event_log.append(f"Round {t}: Message {src}->{dst} delivery failed.")
 
-# --- Visualization ---
+    failures_per_round.append(len([n for n in nodes_sim.values() if not n["alive"]]))
+
+# --- Network Plot ---
 fig, ax = plt.subplots(figsize=(6,6))
+pos = {i: nodes_sim[i]["pos"] for i in nodes_sim}
+node_colors = [compute_color(nodes_sim[i], initial_energy) for i in nodes_sim]
 
-# Only plot alive nodes; keep color list in same order as alive_nodes
-alive_nodes = [i for i in nodes_sim if nodes_sim[i]["alive"]]
-alive_colors = []
-alive_pos = {}
-for i in alive_nodes:
-    alive_colors.append(compute_color(nodes_sim[i], initial_energy))
-    alive_pos[i] = nodes_sim[i]["pos"]
+# Command center node 0 highlighted
+node_color_map = []
+for i in nodes_sim:
+    if i == 0:
+        node_color_map.append("gold")
+    else:
+        node_color_map.append(compute_color(nodes_sim[i], initial_energy))
 
-nx.draw(G, alive_pos, with_labels=True, node_color=alive_colors, ax=ax, node_size=500)
-
-# Draw failed nodes as red 'X'
+nx.draw(G_last, pos, with_labels=True, node_color=node_color_map, ax=ax, node_size=500)
 for i in nodes_sim:
     if not nodes_sim[i]["alive"]:
-        ax.scatter(*nodes_sim[i]["pos"], color='red', marker='x', s=200, label='_nolegend_')
+        ax.scatter(nodes_sim[i]["pos"][0], nodes_sim[i]["pos"][1], marker='x', s=200, linewidths=3)
+
+# Last message path highlight
+last_success = next((h for h in reversed(history) if h["delivered"]), None)
+if show_paths and last_success and len(last_success["path"])>=2:
+    path_edges = list(zip(last_success["path"], last_success["path"][1:]))
+    nx.draw_networkx_edges(G_last, pos, edgelist=path_edges, ax=ax, width=4, edge_color='blue')
 
 ax.set_title(f"Network Topology (Round {st.session_state.current_round})")
 ax.set_xlim(0, area_size)
 ax.set_ylim(0, area_size)
-
-# Highlight last successful message path
-last_success = None
-for h in reversed(history):
-    if h["delivered"]:
-        last_success = h
-        break
-if show_paths and last_success:
-    path = last_success["path"]
-    path_edges = list(zip(path, path[1:]))
-    nx.draw_networkx_edges(G, alive_pos, edgelist=path_edges, ax=ax, width=4, edge_color='blue')
-
 st.pyplot(fig)
 
-# --- Node Info ---
-with st.expander("Click for Node Details Table"):
-    import pandas as pd
+# --- Node Table & Metrics ---
+with st.expander("📊 Node Details & Metrics"):
     node_table = []
-    for i in nodes_sim:
-        status = "Alive" if nodes_sim[i]["alive"] else "Dead"
+    for i in sorted(nodes_sim.keys()):
+        n = nodes_sim[i]
         node_table.append({
             "Node": i,
-            "Status": status,
-            "Energy": f"{nodes_sim[i]['energy']:.1f}",
-            "Delivered": nodes_sim[i]["delivered"]
+            "Status": "Alive" if n["alive"] else "Dead",
+            "Energy": f"{n['energy']:.1f}",
+            "Delivered": n["delivered"],
+            "Messages Sent": n["messages_sent"],
+            "Messages Received": n["messages_received"]
         })
-    st.dataframe(pd.DataFrame(node_table).set_index("Node"))
+    df_nodes = pd.DataFrame(node_table).set_index("Node")
+    st.dataframe(df_nodes)
 
-# --- Performance metrics ---
-successful = [h for h in delivery_stats if h is not None]
-st.write(f"**Delivery Ratio:** {len(successful)}/{len(delivery_stats)} ({100*len(successful)/len(delivery_stats):.1f}%)")
-if successful:
-    st.write(f"**Average Path Length (Hops):** {np.mean(successful):.2f}")
-else:
-    st.write("**Average Path Length (Hops):** N/A")
+# Delivery ratio and average hops
+valid_deliveries = [d for d in delivery_stats if d is not None]
+st.write(f"**Delivery Ratio:** {len(valid_deliveries)}/{len(delivery_stats)} ({100*len(valid_deliveries)/len(delivery_stats):.1f}%)")
+st.write(f"**Average Path Length (Hops):** {np.mean(valid_deliveries) if valid_deliveries else 0:.2f}")
+st.write(f"**Node Failures:** {len([n for n in nodes_sim.values() if not n['alive']])}/{num_nodes}")
 
-failures = [i for i in nodes_sim if not nodes_sim[i]["alive"]]
-st.write(f"**Node Failures:** {len(failures)} / {num_nodes} ({100*len(failures)/num_nodes:.1f}%)")
+# --- Energy & Performance Charts ---
+st.subheader("📈 Performance Charts")
+col1, col2 = st.columns(2)
+with col1:
+    plt.figure()
+    plt.plot(range(1, len(failures_per_round)+1), failures_per_round, marker='o')
+    plt.title("Node Failures per Round")
+    plt.xlabel("Round")
+    plt.ylabel("Number of Failed Nodes")
+    st.pyplot(plt)
 
-st.write("**Legend:** Green = High Energy, Yellow = Medium, Orange = Low, Red/X = Failed Node, Yellow = Command Center (node 0)")
+with col2:
+    avg_energy = [np.mean([n["energy_history"][t] for n in nodes_sim.values() if len(n["energy_history"])>t]) 
+                  for t in range(st.session_state.current_round)]
+    plt.figure()
+    plt.plot(range(1, len(avg_energy)+1), avg_energy, marker='o', color='green')
+    plt.title("Average Network Energy per Round")
+    plt.xlabel("Round")
+    plt.ylabel("Energy")
+    st.pyplot(plt)
+
+# Node energy history plot
+st.subheader("🔋 Node Energy Over Time")
+selected_nodes = st.multiselect("Select nodes to plot", list(nodes_sim.keys()), default=[0])
+plt.figure(figsize=(8,4))
+for i in selected_nodes:
+    plt.plot(nodes_sim[i]["energy_history"], label=f"Node {i}")
+plt.title("Node Energy History")
+plt.xlabel("Round")
+plt.ylabel("Energy")
+plt.legend()
+st.pyplot(plt)
 
 # --- Event Log ---
-with st.expander("Simulation Event Log"):
-    for e in event_log[-30:]:
+with st.expander("📜 Event Log (Last 50 events)"):
+    for e in st.session_state.event_log[-50:]:
         st.write(e)
 
-# --- Replay Controls ---
-if enable_replay:
-    st.warning("Replay mode is enabled. Use the slider above to step through simulation rounds.")
+# --- Export CSV ---
+st.subheader("💾 Export Simulation Data")
+col1, col2 = st.columns(2)
+with col1:
+    csv_nodes = df_nodes.to_csv().encode('utf-8')
+    st.download_button("Download Node Data CSV", csv_nodes, "nodes.csv", "text/csv")
+with col2:
+    df_events = pd.DataFrame(st.session_state.event_log, columns=["Event"])
+    csv_events = df_events.to_csv(index=False).encode('utf-8')
+    st.download_button("Download Event Log CSV", csv_events, "event_log.csv", "text/csv")
 
-st.info("Try changing parameters, mobility, routing, and pressing 'Reset Simulation' to explore different scenarios. Each run is randomized!")
+st.info("🔹 Try changing parameters, routing, mobility, or reset simulation to explore scenarios!")
