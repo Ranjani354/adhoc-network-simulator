@@ -73,24 +73,33 @@ for t in range(rounds):
 
 # Visualization
 fig, ax = plt.subplots(figsize=(6,6))
-colors = []
-for i in nodes:
-    if nodes[i]["alive"]:
-        colors.append('green' if i != 0 else 'yellow')
-    else:
-        colors.append('red')
 
-pos = {i: nodes[i]["pos"] for i in nodes}
-nx.draw(G, pos, with_labels=True, node_color=colors, ax=ax, node_size=500)
+# Only plot alive nodes; keep color list in same order as alive_nodes
+alive_colors = []
+alive_pos = {}
+for i in alive_nodes:
+    if i == 0:
+        alive_colors.append('yellow')  # Command center
+    else:
+        alive_colors.append('green')
+    alive_pos[i] = nodes[i]["pos"]
+
+nx.draw(G, alive_pos, with_labels=True, node_color=alive_colors, ax=ax, node_size=500)
+
+# Draw failed nodes as red 'X'
+for i in nodes:
+    if not nodes[i]["alive"]:
+        ax.scatter(*nodes[i]["pos"], color='red', marker='x', s=200, label='_nolegend_')
+
 ax.set_title("Network Topology (Final Round)")
 ax.set_xlim(0, area_size)
 ax.set_ylim(0, area_size)
 
-# Highlight last message path
+# Highlight last successful message path
 if show_paths and history and history[-1]["delivered"]:
     path = history[-1]["path"]
     path_edges = list(zip(path, path[1:]))
-    nx.draw_networkx_edges(G, pos, edgelist=path_edges, ax=ax, width=4, edge_color='blue')
+    nx.draw_networkx_edges(G, alive_pos, edgelist=path_edges, ax=ax, width=4, edge_color='blue')
 
 st.pyplot(fig)
 
